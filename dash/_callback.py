@@ -854,6 +854,7 @@ def register_clientside_callback(
         None,
         prevent_initial_call,
         no_output=no_output,
+        hidden=kwargs.get("hidden", False),
     )
 
     # If JS source is explicitly given, create a namespace and function
