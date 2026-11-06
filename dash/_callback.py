@@ -90,6 +90,8 @@ def callback(
     cache_args_to_ignore: Optional[list] = None,
     cache_ignore_triggered=True,
     on_error: Optional[Callable[[Exception], Any]] = None,
+    preprocess: Optional[Callable[[Any], Any]] = None,
+    postprocess: Optional[Callable[[Any], Any]] = None,
     api_endpoint: Optional[str] = None,
     optional: Optional[bool] = False,
     hidden: Optional[bool] = None,
@@ -190,6 +192,19 @@ def callback(
             Function to call when the callback raises an exception. Receives the
             exception object as first argument. The callback_context can be used
             to access the original callback inputs, states and output.
+        :param preprocess:
+            Optional function run only for this callback before user code. It
+            receives a mutable context object with ``args``, ``kwargs``,
+            ``callback_id`` and ``output_spec``. Return ``None`` to keep
+            context values, or return ``(args, kwargs)`` (or a dict with
+            ``args``/``kwargs``) to replace callback inputs. Set
+            ``context.skip_callback = True`` and ``context.output_value`` to
+            short-circuit execution.
+        :param postprocess:
+            Optional function run only for this callback after user code. It
+            receives the same context object with ``output_value`` populated.
+            Return ``None`` to keep the current output, or return a value to
+            replace the callback output.
         :param optional:
             Mark all dependencies as not required on the initial layout checks.
         :param hidden:
@@ -269,6 +284,8 @@ def callback(
         manager=manager,
         running=running,
         on_error=on_error,
+        preprocess=preprocess,
+        postprocess=postprocess,
         api_endpoint=api_endpoint,
         optional=optional,
         hidden=hidden,
@@ -432,6 +449,158 @@ def _set_side_update(ctx, response) -> bool:
         response["sideUpdate"] = side_update
         return True
     return False
+
+
+def _build_callback_hook_ctx(
+    callback_id, output_spec, callback_ctx, func_args, func_kwargs, output_value=None
+):
+    return AttributeDict(
+        {
+            "callback_id": callback_id,
+            "output_spec": output_spec,
+            "callback_context": callback_ctx,
+            "args": list(func_args or []),
+            "kwargs": dict(func_kwargs or {}),
+            "skip_callback": False,
+            "output_value": output_value,
+        }
+    )
+
+
+def _apply_pre_hook_result(hook_ctx, result):
+    if result is None:
+        return
+    if isinstance(result, tuple) and len(result) == 2:
+        hook_ctx.args = list(result[0] or [])
+        hook_ctx.kwargs = dict(result[1] or {})
+        return
+    if isinstance(result, dict):
+        if "args" in result:
+            hook_ctx.args = list(result.get("args") or [])
+        if "kwargs" in result:
+            hook_ctx.kwargs = dict(result.get("kwargs") or {})
+        return
+    raise TypeError(
+        "preprocess must return None, (args, kwargs), or a dict with 'args'/'kwargs'"
+    )
+
+
+def _invoke_hook_sync(hook, hook_ctx, callback_ctx):
+    token = context_value.set(callback_ctx)
+    try:
+        result = hook(hook_ctx)
+    finally:
+        context_value.reset(token)
+
+    if inspect.isawaitable(result):
+        raise RuntimeError(
+            "Async callback hooks require an async callback. "
+            "Use 'async def' for the callback or make the hook synchronous."
+        )
+    return result
+
+
+async def _invoke_hook_async(hook, hook_ctx, callback_ctx):
+    token = context_value.set(callback_ctx)
+    try:
+        result = hook(hook_ctx)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    finally:
+        context_value.reset(token)
+
+
+def _run_callback_preprocess_sync(
+    preprocess, callback_id, output_spec, callback_ctx, func_args, func_kwargs
+):
+    if preprocess is None:
+        return func_args, func_kwargs, False, None
+
+    hook_ctx = _build_callback_hook_ctx(
+        callback_id, output_spec, callback_ctx, func_args, func_kwargs
+    )
+    result = _invoke_hook_sync(preprocess, hook_ctx, callback_ctx)
+    _apply_pre_hook_result(hook_ctx, result)
+
+    return (
+        tuple(hook_ctx.args),
+        hook_ctx.kwargs,
+        bool(hook_ctx.get("skip_callback")),
+        hook_ctx.get("output_value"),
+    )
+
+
+async def _run_callback_preprocess_async(
+    preprocess, callback_id, output_spec, callback_ctx, func_args, func_kwargs
+):
+    if preprocess is None:
+        return func_args, func_kwargs, False, None
+
+    hook_ctx = _build_callback_hook_ctx(
+        callback_id, output_spec, callback_ctx, func_args, func_kwargs
+    )
+    result = await _invoke_hook_async(preprocess, hook_ctx, callback_ctx)
+    _apply_pre_hook_result(hook_ctx, result)
+
+    return (
+        tuple(hook_ctx.args),
+        hook_ctx.kwargs,
+        bool(hook_ctx.get("skip_callback")),
+        hook_ctx.get("output_value"),
+    )
+
+
+def _run_callback_postprocess_sync(
+    postprocess,
+    callback_id,
+    output_spec,
+    callback_ctx,
+    func_args,
+    func_kwargs,
+    output_value,
+):
+    if postprocess is None:
+        return output_value
+
+    hook_ctx = _build_callback_hook_ctx(
+        callback_id,
+        output_spec,
+        callback_ctx,
+        func_args,
+        func_kwargs,
+        output_value=output_value,
+    )
+    result = _invoke_hook_sync(postprocess, hook_ctx, callback_ctx)
+    if result is not None:
+        hook_ctx.output_value = result
+    return hook_ctx.output_value
+
+
+async def _run_callback_postprocess_async(
+    postprocess,
+    callback_id,
+    output_spec,
+    callback_ctx,
+    func_args,
+    func_kwargs,
+    output_value,
+):
+    if postprocess is None:
+        return output_value
+
+    hook_ctx = _build_callback_hook_ctx(
+        callback_id,
+        output_spec,
+        callback_ctx,
+        func_args,
+        func_kwargs,
+        output_value=output_value,
+    )
+    result = await _invoke_hook_async(postprocess, hook_ctx, callback_ctx)
+    if result is not None:
+        hook_ctx.output_value = result
+    return hook_ctx.output_value
 
 
 def _initialize_context(args, kwargs, inputs_state_indices, has_output, insert_output):
@@ -883,6 +1052,8 @@ def register_callback(
     manager = _kwargs.get("manager")
     running = _kwargs.get("running")
     on_error = _kwargs.get("on_error")
+    preprocess = _kwargs.get("preprocess")
+    postprocess = _kwargs.get("postprocess")
     if running is not None:
         if not isinstance(running[0], (list, tuple)):
             running = [running]
@@ -992,7 +1163,32 @@ def register_callback(
                     if skip:
                         return output_value
                 else:
-                    output_value = _invoke_callback(func, *func_args, **func_kwargs)  # type: ignore[reportArgumentType]
+                    (
+                        func_args,
+                        func_kwargs,
+                        skip_callback,
+                        hook_output_value,
+                    ) = _run_callback_preprocess_sync(
+                        preprocess,
+                        callback_id,
+                        output_spec,
+                        callback_ctx,
+                        func_args,
+                        func_kwargs,
+                    )
+                    if skip_callback:
+                        output_value = hook_output_value
+                    else:
+                        output_value = _invoke_callback(func, *func_args, **func_kwargs)  # type: ignore[reportArgumentType]
+                    output_value = _run_callback_postprocess_sync(
+                        postprocess,
+                        callback_id,
+                        output_spec,
+                        callback_ctx,
+                        func_args,
+                        func_kwargs,
+                        output_value,
+                    )
             except PreventUpdate:
                 raise
             except Exception as err:  # pylint: disable=broad-exception-caught
@@ -1020,11 +1216,10 @@ def register_callback(
                 allow_dynamic_callbacks,
             )
             try:
-                jsonResponse = to_json(response)
+                return to_json(response)
             except TypeError:
                 _validate.fail_callback_output(output_value, output)
-
-            return jsonResponse
+                return to_json(response)
 
         @wraps(func)
         async def async_add_context(*args, **kwargs):
@@ -1070,8 +1265,33 @@ def register_callback(
                     if skip:
                         return output_value
                 else:
-                    output_value = await _async_invoke_callback(
-                        func, *func_args, **func_kwargs
+                    (
+                        func_args,
+                        func_kwargs,
+                        skip_callback,
+                        hook_output_value,
+                    ) = await _run_callback_preprocess_async(
+                        preprocess,
+                        callback_id,
+                        output_spec,
+                        callback_ctx,
+                        func_args,
+                        func_kwargs,
+                    )
+                    if skip_callback:
+                        output_value = hook_output_value
+                    else:
+                        output_value = await _async_invoke_callback(
+                            func, *func_args, **func_kwargs
+                        )
+                    output_value = await _run_callback_postprocess_async(
+                        postprocess,
+                        callback_id,
+                        output_spec,
+                        callback_ctx,
+                        func_args,
+                        func_kwargs,
+                        output_value,
                     )
             except PreventUpdate:
                 raise
@@ -1099,11 +1319,10 @@ def register_callback(
                 allow_dynamic_callbacks,
             )
             try:
-                jsonResponse = to_json(response)
+                return to_json(response)
             except TypeError:
                 _validate.fail_callback_output(output_value, output)
-
-            return jsonResponse
+                return to_json(response)
 
         def _build_stream_frame(
             output_value, output_spec, callback_ctx, app, original_packages
@@ -1145,7 +1364,15 @@ def register_callback(
             return {"done": True, "error": {"message": str(err) or repr(err)}}
 
         async def _astream_frames(
-            user_gen, error_handler, output_spec, callback_ctx, app, original_packages
+            user_gen,
+            error_handler,
+            output_spec,
+            callback_ctx,
+            app,
+            original_packages,
+            func_args,
+            func_kwargs,
+            postprocess,
         ):
             # Set the callback context var around each resumption of the user
             # generator so dash.ctx/set_props resolve while its body runs. It is
@@ -1173,6 +1400,15 @@ def register_callback(
                     frame = None
                     try:
                         output_value = await _next()
+                        output_value = await _run_callback_postprocess_async(
+                            postprocess,
+                            callback_id,
+                            output_spec,
+                            callback_ctx,
+                            func_args,
+                            func_kwargs,
+                            output_value,
+                        )
                         frame = _build_stream_frame(
                             output_value,
                             output_spec,
@@ -1186,6 +1422,15 @@ def register_callback(
                         if error_handler:
                             output_value = _handle_error(err)
                             if output_value is not None:
+                                output_value = await _run_callback_postprocess_async(
+                                    postprocess,
+                                    callback_id,
+                                    output_spec,
+                                    callback_ctx,
+                                    func_args,
+                                    func_kwargs,
+                                    output_value,
+                                )
                                 frame = _build_stream_frame(
                                     output_value,
                                     output_spec,
@@ -1221,6 +1466,35 @@ def register_callback(
                 args, kwargs, inputs_state_indices, has_output, insert_output
             )
 
+            (
+                func_args,
+                func_kwargs,
+                skip_callback,
+                hook_output_value,
+            ) = await _run_callback_preprocess_async(
+                preprocess,
+                callback_id,
+                output_spec,
+                callback_ctx,
+                func_args,
+                func_kwargs,
+            )
+
+            if skip_callback:
+                async def _short_circuit_frames():
+                    frame = _build_stream_frame(
+                        hook_output_value,
+                        output_spec,
+                        callback_ctx,
+                        app,
+                        original_packages,
+                    )
+                    if frame is not None:
+                        yield frame
+                    yield {"done": True}
+
+                return StreamedCallbackResponse(_short_circuit_frames(), is_async=True)
+
             user_gen = _invoke_callback(func, *func_args, **func_kwargs)
             frames = _astream_frames(
                 user_gen,
@@ -1229,6 +1503,9 @@ def register_callback(
                 callback_ctx,
                 app,
                 original_packages,
+                func_args,
+                func_kwargs,
+                postprocess,
             )
             return StreamedCallbackResponse(frames, is_async=True)
 

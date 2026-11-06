@@ -340,3 +340,52 @@ def test_hook012_get_app_available_in_hooks_on_routes(hook_cleanup, dash_duo):
     assert hook_access_results[
         "error_hook"
     ], "get_app() should be accessible in error hook when dispatch route has @with_app_context"
+
+
+def test_hook013_callback_pre_post(hook_cleanup, dash_duo):
+    def pre_hook(hook_ctx):
+        args = list(hook_ctx.args)
+        args[0] = args[0] + 10
+        return args, hook_ctx.kwargs
+
+    def post_hook(hook_ctx):
+        return f"post:{hook_ctx.output_value}"
+
+    app = Dash()
+    app.layout = [html.Button("go", id="go"), html.Div(id="output")]
+
+    @app.callback(
+        Output("output", "children"),
+        Input("go", "n_clicks"),
+        prevent_initial_call=True,
+        preprocess=pre_hook,
+        postprocess=post_hook,
+    )
+    def cb(n_clicks):
+        return f"clicked {n_clicks}"
+
+    dash_duo.start_server(app)
+    dash_duo.wait_for_element("#go").click()
+    dash_duo.wait_for_text_to_equal("#output", "post:clicked 11")
+
+
+def test_hook014_callback_pre_skip(hook_cleanup, dash_duo):
+    def pre_hook(hook_ctx):
+        hook_ctx.skip_callback = True
+        hook_ctx.output_value = "pre-short-circuit"
+
+    app = Dash()
+    app.layout = [html.Button("go", id="go"), html.Div(id="output")]
+
+    @app.callback(
+        Output("output", "children"),
+        Input("go", "n_clicks"),
+        prevent_initial_call=True,
+        preprocess=pre_hook,
+    )
+    def cb(_):
+        raise Exception("callback should not execute")
+
+    dash_duo.start_server(app)
+    dash_duo.wait_for_element("#go").click()
+    dash_duo.wait_for_text_to_equal("#output", "pre-short-circuit")
